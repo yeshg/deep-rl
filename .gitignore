@@ -110,3 +110,6 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# take this out later - yesh
+runs/
