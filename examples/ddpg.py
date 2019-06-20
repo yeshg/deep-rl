@@ -1,10 +1,16 @@
-import argparse
-#from tensorboardX import SummaryWriter
 
-import gym
-import gym_cassie
+
+import argparse
+import math
+from collections import namedtuple
+from itertools import count
+from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import time
+
 
 import numpy as np
+#from gym import wrappers
 
 import torch
 import torch.nn as nn
@@ -23,33 +29,7 @@ from torch.optim import Adam
 import random
 from collections import namedtuple
 
-
-# TODO: put this in utils, refactor out of the scripts in examples
-def gym_factory(path, **kwargs):
-    from functools import partial
-
-    """
-    This is (mostly) equivalent to gym.make(), but it returns an *uninstantiated* 
-    environment constructor.
-
-    Since environments containing cpointers (e.g. Mujoco envs) can't be serialized, 
-    this allows us to pass their constructors to Ray remote functions instead 
-    (since the gym registry isn't shared across ray subprocesses we can't simply 
-    pass gym.make() either)
-
-    Note: env.unwrapped.spec is never set, if that matters for some reason.
-    """
-    spec = gym.envs.registry.spec(path)
-    _kwargs = spec._kwargs.copy()
-    _kwargs.update(kwargs)
-    
-    if callable(spec._entry_point):
-        cls = spec._entry_point(**_kwargs)
-    else:
-        cls = gym.envs.registration.load(spec._entry_point)
-
-    return partial(cls, **_kwargs)
-
+import gym
 
 # from https://github.com/songrotek/DDPG/blob/master/ou_noise.py
 class OUNoise:
@@ -115,6 +95,8 @@ def ddpg_distance_metric(actions1, actions2):
     mean_diff = np.mean(np.square(diff), axis=0)
     dist = sqrt(np.mean(mean_diff))
     return dist
+
+
 
 
 class Actor(nn.Module):
@@ -190,7 +172,6 @@ class NormalizedActions(gym.ActionWrapper):
         action = action * 2 - 1
         return action
 
-# From ikostrov's repo https://github.com/ikostrikov/pytorch-ddpg-naf
 def soft_update(target, source, tau):
     for target_param, param in zip(target.parameters(), source.parameters()):
         target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
@@ -229,26 +210,31 @@ class DDPG(object):
         self.num_inputs = num_inputs
         self.action_space = action_space
 
+        """
+        Initialize actor and critic networks. Also initialize target networks
+        """
         self.actor = Actor(hidden_size, self.num_inputs, self.action_space)
         self.actor_target = Actor(hidden_size, self.num_inputs, self.action_space)
         self.actor_perturbed = Actor(hidden_size, self.num_inputs, self.action_space)
-        self.actor_optim = Adam(self.actor.parameters(), lr=args.actor_lr)
+        self.actor_optim = Adam(self.actor.parameters(), lr=1e-4)
 
         self.critic = Critic(hidden_size, self.num_inputs, self.action_space)
         self.critic_target = Critic(hidden_size, self.num_inputs, self.action_space)
-        self.critic_optim = Adam(self.critic.parameters(), lr=args.critic_lr)
+        self.critic_optim = Adam(self.critic.parameters(), lr=1e-3)
 
         self.gamma = gamma
         self.tau = tau
 
-        hard_update(self.algoarget, self.actor)  # Make sure target is with the same weight
-        hard_update(self.algotarget, self.critic)
+        """
+        Copy initial params of the actor and critic networks to their respective target networks
+        """
+        hard_update(self.actor_target, self.actor)  # Make sure target is with the same weight
+        hard_update(self.critic_target, self.critic)
 
 
-    def select_action(selalgoe, action_noise=None, param_noise=None):
+    def select_action(self, state, action_noise=None, param_noise=None):
         self.actor.eval()
         if param_noise is not None: 
-            # add parameter noise for exploration
             mu = self.actor_perturbed((Variable(state)))
         else:
             mu = self.actor((Variable(state)))
@@ -257,7 +243,6 @@ class DDPG(object):
         mu = mu.data
 
         if action_noise is not None:
-            # add action noise for exploration
             mu += torch.Tensor(action_noise.noise())
 
         return mu.clamp(-1, 1)
@@ -270,29 +255,42 @@ class DDPG(object):
         mask_batch = Variable(torch.cat(batch.mask))
         next_state_batch = Variable(torch.cat(batch.next_state))
         
+        """
+        In DDPG, next-state Q values are calculated with the target value network and target policy network
+        Once this is calculated, 
+        """
         next_action_batch = self.actor_target(next_state_batch)
         next_state_action_values = self.critic_target(next_state_batch, next_action_batch)
 
         reward_batch = reward_batch.unsqueeze(1)
         mask_batch = mask_batch.unsqueeze(1)
+        # This is bellman equation
         expected_state_action_batch = reward_batch + (self.gamma * mask_batch * next_state_action_values)
 
-        self.critic_optim.zero_grad()
-
+        """
+        Minimize MSE loss between updated Q value and original Q value
+        """
         state_action_batch = self.critic((state_batch), (action_batch))
 
         value_loss = F.mse_loss(state_action_batch, expected_state_action_batch)
+        self.critic_optim.zero_grad()
         value_loss.backward()
         self.critic_optim.step()
 
-        self.actor_optim.zero_grad()
-
+        """
+        Maxmize expected return for policy function
+        """
         policy_loss = -self.critic((state_batch),self.actor((state_batch)))
+
+        self.actor_optim.zero_grad()
 
         policy_loss = policy_loss.mean()
         policy_loss.backward()
         self.actor_optim.step()
 
+        """
+        Update the target networks ()
+        """
         soft_update(self.actor_target, self.actor, self.tau)
         soft_update(self.critic_target, self.critic, self.tau)
 
@@ -327,8 +325,114 @@ class DDPG(object):
         if critic_path is not None: 
             self.critic.load_state_dict(torch.load(critic_path))
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--env-name', type=str, default="HalfCheetah-v2",
+    def train(self, env, memory, num_episodes, ounoise, param_noise, args):
+
+        rewards = []
+        total_numsteps = 0
+        updates = 0
+
+        start_time = time.time()
+
+        for i_episode in range(args.num_episodes):
+            print("********** Episode {} ************".format(i_episode))
+            state = torch.Tensor([env.reset()])
+
+            if args.ou_noise: 
+                ounoise.scale = (args.noise_scale - args.final_noise_scale) * max(0, args.exploration_end -
+                                                                            i_episode) / args.exploration_end + args.final_noise_scale
+                ounoise.reset()
+
+            if args.param_noise:
+                self.perturb_actor_parameters(param_noise)
+
+            episode_reward = 0
+            episode_start = time.time()
+            while True:
+                """
+                select action according to current policy and exploration noise
+                """
+                action = agent.select_action(state, ounoise, param_noise)
+
+                """
+                execute action and observe reward and new state
+                """
+                next_state, reward, done, _ = env.step(action.numpy()[0])
+                total_numsteps += 1
+                episode_reward += reward
+
+                action = torch.Tensor(action)
+                mask = torch.Tensor([not done])
+                next_state = torch.Tensor([next_state])
+                reward = torch.Tensor([reward])
+
+                """
+                store transition tuple in replay buffer
+                """
+                memory.push(state, action, mask, next_state, reward)
+
+                state = next_state
+
+                if len(memory) > args.batch_size:
+                    for _ in range(args.updates_per_step):
+                        """
+                        Sample random minibatch of (args.batch_size) transitions
+                        """
+                        transitions = memory.sample(args.batch_size)
+                        batch = Transition(*zip(*transitions))
+
+                        """
+                        Calculate updated Q value (Bellman equation) and update parameters of all networks
+                        """
+                        value_loss, policy_loss = agent.update_parameters(batch)
+
+                        writer.add_scalar('loss/value', value_loss, updates)
+                        writer.add_scalar('loss/policy', policy_loss, updates)
+
+                        updates += 1
+                if done:
+                    break
+
+            print("time elapsed: {:.2f} s".format(time.time() - start_time))
+            print("episode time elapsed: {:.2f} s".format(time.time() - episode_start))
+
+            writer.add_scalar('reward/train', episode_reward, i_episode)
+
+            # Update param_noise based on distance metric
+            if args.param_noise:
+                episode_transitions = memory.memory[memory.position-t:memory.position]
+                states = torch.cat([transition[0] for transition in episode_transitions], 0)
+                unperturbed_actions = agent.select_action(states, None, None)
+                perturbed_actions = torch.cat([transition[1] for transition in episode_transitions], 0)
+
+                ddpg_dist = ddpg_distance_metric(perturbed_actions.numpy(), unperturbed_actions.numpy())
+                param_noise.adapt(ddpg_dist)
+
+            rewards.append(episode_reward)
+            if i_episode % 10 == 0:
+                state = torch.Tensor([env.reset()])
+                episode_reward = 0
+                while True:
+                    action = agent.select_action(state)
+
+                    next_state, reward, done, _ = env.step(action.numpy()[0])
+                    episode_reward += reward
+
+                    next_state = torch.Tensor([next_state])
+
+                    state = next_state
+                    if done:
+                        break
+
+                writer.add_scalar('reward/test', episode_reward, i_episode)
+
+                rewards.append(episode_reward)
+                print("Episode: {}, total numsteps: {}, reward: {}, average reward: {}".format(i_episode, total_numsteps, rewards[-1], np.mean(rewards[-10:])))
+
+
+parser = argparse.ArgumentParser(description='PyTorch REINFORCE example')
+parser.add_argument('--algo', default='DDPG',
+                    help='algorithm to use: DDPG | NAF')
+parser.add_argument('--env-name', default="HalfCheetah-v2",
                     help='name of the environment to run')
 parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
                     help='discount factor for reward (default: 0.99)')
@@ -344,6 +448,8 @@ parser.add_argument('--exploration_end', type=int, default=100, metavar='N',
                     help='number of episodes with noise (default: 100)')
 parser.add_argument('--seed', type=int, default=4, metavar='N',
                     help='random seed (default: 4)')
+parser.add_argument('--batch_size', type=int, default=128, metavar='N',
+                    help='batch size (default: 128)')
 parser.add_argument('--num_steps', type=int, default=1000, metavar='N',
                     help='max episode length (default: 1000)')
 parser.add_argument('--num_episodes', type=int, default=1000, metavar='N',
@@ -356,16 +462,7 @@ parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
                     help='size of replay buffer (default: 1000000)')
 args = parser.parse_args()
 
-args.batch_size = 128
-args.actor_lr = 1e-3
-args.critic_lr = 1e-4
-
-#args.num_procs = 30   # this will be used later for D4PG
-
 env = NormalizedActions(gym.make(args.env_name))
-
-#env_fn = gym_factory(args.env-name)
-
 
 writer = SummaryWriter()
 
@@ -375,90 +472,20 @@ np.random.seed(args.seed)
 agent = DDPG(args.gamma, args.tau, args.hidden_size,
                     env.observation_space.shape[0], env.action_space)
 
+"""
+Initialize Replay Buffer
+"""
 memory = DDPGBuffer(args.replay_size)
 
+"""
+Action noise and parameter noise for exploration
+"""
 ounoise = OUNoise(env.action_space.shape[0]) if args.ou_noise else None
-param_noise = AdaptiveParamNoiseSpec(initial_stddev=0.05, 
-    desired_action_stddev=args.noise_scale, adaptation_coefficient=1.05) if args.param_noise else None
+param_noise = AdaptiveParamNoiseSpec(initial_stddev=0.05, desired_action_stddev=args.noise_scale, adaptation_coefficient=1.05) if args.param_noise else None
 
-rewards = []
-total_numsteps = 0
-updates = 0
-
-for i_episode in range(args.num_episodes):
-    state = torch.Tensor([env.reset()])
-
-    """Generate noise correlated with previous noise via Ornstein-Uhlenbeck Process"""
-    if args.ou_noise: 
-        ounoise.scale = (args.noise_scale - args.final_noise_scale) * max(0, args.exploration_end -
-                                                                      i_episode) / args.exploration_end + args.final_noise_scale
-        ounoise.reset()
-
-    if args.param_noise:
-        """Apply parameter noise to actor model, for exploration"""
-        agent.perturb_actor_parameters(param_noise)
-
-    episode_reward = 0
-    while True:
-        action = agent.select_action(state, ounoise, param_noise)
-        next_state, reward, done, _ = env.step(action.numpy()[0])
-        total_numsteps += 1
-        episode_reward += reward
-
-        action = torch.Tensor(action)
-        mask = torch.Tensor([not done])
-        next_state = torch.Tensor([next_state])
-        reward = torch.Tensor([reward])
-
-        memory.push(state, action, mask, next_state, reward)
-
-        state = next_state
-
-        if len(memory) > args.batch_size:
-            for _ in range(args.updates_per_step):
-                transitions = memory.sample(args.batch_size)
-                batch = Transition(*zip(*transitions))
-
-                value_loss, policy_loss = agent.update_parameters(batch)
-
-                writer.add_scalar('loss/value', value_loss, updates)
-                writer.add_scalar('loss/policy', policy_loss, updates)
-
-                updates += 1
-        if done:
-            break
-
-    writer.add_scalar('reward/train', episode_reward, i_episode)
-
-    # Update param_noise based on distance metric
-    if args.param_noise:
-        episode_transitions = memory.memory[memory.position-t:memory.position]
-        states = torch.cat([transition[0] for transition in episode_transitions], 0)
-        unperturbed_actions = agent.select_action(states, None, None)
-        perturbed_actions = torch.cat([transition[1] for transition in episode_transitions], 0)
-
-        ddpg_dist = ddpg_distance_metric(perturbed_actions.numpy(), unperturbed_actions.numpy())
-        param_noise.adapt(ddpg_dist)
-
-    rewards.append(episode_reward)
-    if i_episode % 10 == 0:
-        state = torch.Tensor([env.reset()])
-        episode_reward = 0
-        while True:
-            action = agent.select_action(state)
-
-            next_state, reward, done, _ = env.step(action.numpy()[0])
-            episode_reward += reward
-
-            next_state = torch.Tensor([next_state])
-
-            state = next_state
-            if done:
-                break
-
-        writer.add_scalar('reward/test', episode_reward, i_episode)
-
-        rewards.append(episode_reward)
-        print("Episode: {}, total numsteps: {}, reward: {}, average reward: {}".format(i_episode, total_numsteps, rewards[-1], np.mean(rewards[-10:])))
+"""
+Start training loop
+"""
+agent.train(env, memory, args.num_episodes, ounoise, param_noise, args)
     
 env.close()
