@@ -4,12 +4,12 @@ from subprocess import Popen
 from functools import partial
 import torch.multiprocessing as mp
 from .render import renderloop
-from .logging import Logger
+from .logging import VisdomLinePlotter
 from rl.envs import Normalize, Vectorize
 
 
 def run_experiment(algo, policy, env_fn, args, log=True, monitor=False, render=False):
-    logger = Logger(args, viz=monitor) if log else None
+    logger = VisdomLinePlotter("Cassie_PPO") if log else None
 
     # HOTFIX for Patrick's desktop: (MP is buggy on it for some reason)
     if render:
